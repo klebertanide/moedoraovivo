@@ -1,0 +1,15 @@
+# Configurações da moedor.com (MANTENHA ESTE ARQUIVO SEGURO!)
+MOEDOR_WEBHOOK_URL=https://moedor.com/api/webhook
+MOEDOR_HOTTOK=zly3uuSG0RotUGCq0sUYE6V8GF7y2b311c8d60-fc10-4bf5-b4e7-35d37ffde162
+MOEDOR_SITE_URL=https://moedor.com
+
+# Configurações do Flask
+FLASK_SECRET_KEY=moedor-ao-vivo-2024-super-secure-key
+
+# Emails autorizados extras (separados por vírgula)
+AUTHORIZED_EMAILS=kaa.naomi25@gmail.com
+
+# Configurações de desenvolvimento
+DEBUG=False
+ENVIRONMENT=production
+

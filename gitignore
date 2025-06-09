@@ -1,0 +1,27 @@
+# Arquivo .env - NUNCA COMMITAR ESTE ARQUIVO!
+.env
+
+# Logs
+*.log
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ambiente virtual
+venv/
+env/
+
+# Arquivos temporários
+*.tmp
+*.temp
+
+# Arquivos de sistema
+.DS_Store
+Thumbs.db
+
+# Arquivos de backup
+*.bak
+*.backup
+
