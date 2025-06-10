@@ -22,7 +22,6 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 authorized_buyers = {
     'admin@moedor.com',
     'teste@moedor.com',
-    'kaa.naomi25@gmail.com',  # Para teste inicial
 }
 
 # Log de webhooks recebidos
