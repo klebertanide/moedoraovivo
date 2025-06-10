@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Micro-app Flask: Login mínimo e redirecionamento
-"""
-
 import os
 from datetime import timedelta
 from flask import Flask, request, session, redirect, render_template_string
