@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MOEDOR AO VIVO - Sistema com OAuth Hotmart
+MOEDOR AO VIVO - Sistema com OAuth Hotmart (Versão Debug)
 Autenticação automática de compradores via API da Hotmart
 """
 
@@ -38,6 +38,15 @@ token_expires_at = None
 verified_buyers = set()
 cache_expires_at = None
 
+# Lista local para testes (enquanto API não funciona)
+local_authorized_buyers = {
+    'admin@moedor.com',
+    'teste@moedor.com',
+    'leo-brde@hotmail.com',  # Adicionado para teste
+    'kaa.naomi25@gmail.com',
+    'dudu.s.poton@gmail.com'
+}
+
 # Dados em memória
 users_online = 0
 messages = []
@@ -52,22 +61,65 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def create_basic_auth_token(client_id, client_secret):
+    """Cria token Basic Auth a partir do client_id e client_secret"""
+    credentials = f"{client_id}:{client_secret}"
+    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
+    return encoded_credentials
+
 def get_hotmart_access_token():
-    """Obtém access token da Hotmart"""
+    """Obtém access token da Hotmart com múltiplos métodos"""
     global hotmart_access_token, token_expires_at
     
     # Verificar se token ainda é válido
     if hotmart_access_token and token_expires_at and datetime.now() < token_expires_at:
         return hotmart_access_token
     
-    if not HOTMART_CLIENT_ID or not HOTMART_CLIENT_SECRET or not HOTMART_BASIC_TOKEN:
-        print("❌ Credenciais da Hotmart não configuradas")
+    if not HOTMART_CLIENT_ID or not HOTMART_CLIENT_SECRET:
+        print("❌ Client ID ou Client Secret não configurados")
         return None
     
     try:
         print("🔑 Obtendo access token da Hotmart...")
+        print(f"🔧 Client ID: {HOTMART_CLIENT_ID[:10]}...")
+        print(f"🔧 Client Secret: {HOTMART_CLIENT_SECRET[:10]}...")
         
-        # Preparar dados da requisição
+        # Método 1: Usar Basic Token fornecido
+        if HOTMART_BASIC_TOKEN:
+            print("📡 Tentativa 1: Usando Basic Token fornecido")
+            
+            data = {
+                'grant_type': 'client_credentials',
+                'client_id': HOTMART_CLIENT_ID,
+                'client_secret': HOTMART_CLIENT_SECRET
+            }
+            
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Authorization': f'Basic {HOTMART_BASIC_TOKEN}'
+            }
+            
+            print(f"🔧 Headers: {headers}")
+            print(f"🔧 Data: {data}")
+            
+            response = requests.post(HOTMART_AUTH_URL, data=data, headers=headers, timeout=30)
+            
+            print(f"📡 Status: {response.status_code}")
+            print(f"📡 Response: {response.text}")
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                hotmart_access_token = token_data.get('access_token')
+                expires_in = token_data.get('expires_in', 3600)
+                token_expires_at = datetime.now() + timedelta(seconds=expires_in - 300)
+                print(f"✅ Token obtido com método 1!")
+                return hotmart_access_token
+        
+        # Método 2: Criar Basic Token automaticamente
+        print("📡 Tentativa 2: Criando Basic Token automaticamente")
+        
+        auto_basic_token = create_basic_auth_token(HOTMART_CLIENT_ID, HOTMART_CLIENT_SECRET)
+        
         data = {
             'grant_type': 'client_credentials',
             'client_id': HOTMART_CLIENT_ID,
@@ -76,27 +128,53 @@ def get_hotmart_access_token():
         
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': f'Basic {HOTMART_BASIC_TOKEN}'
+            'Authorization': f'Basic {auto_basic_token}'
         }
         
-        # Fazer requisição
+        print(f"🔧 Auto Basic Token: {auto_basic_token[:20]}...")
+        print(f"🔧 Headers: {headers}")
+        
         response = requests.post(HOTMART_AUTH_URL, data=data, headers=headers, timeout=30)
         
-        print(f"📡 Status da requisição: {response.status_code}")
+        print(f"📡 Status: {response.status_code}")
+        print(f"📡 Response: {response.text}")
         
         if response.status_code == 200:
             token_data = response.json()
             hotmart_access_token = token_data.get('access_token')
             expires_in = token_data.get('expires_in', 3600)
-            
-            # Calcular quando o token expira (com margem de segurança)
             token_expires_at = datetime.now() + timedelta(seconds=expires_in - 300)
-            
-            print(f"✅ Token obtido com sucesso! Expira em: {token_expires_at}")
+            print(f"✅ Token obtido com método 2!")
             return hotmart_access_token
-        else:
-            print(f"❌ Erro ao obter token: {response.status_code} - {response.text}")
-            return None
+        
+        # Método 3: Sem Basic Auth, apenas form data
+        print("📡 Tentativa 3: Apenas form data")
+        
+        data = {
+            'grant_type': 'client_credentials',
+            'client_id': HOTMART_CLIENT_ID,
+            'client_secret': HOTMART_CLIENT_SECRET
+        }
+        
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        
+        response = requests.post(HOTMART_AUTH_URL, data=data, headers=headers, timeout=30)
+        
+        print(f"📡 Status: {response.status_code}")
+        print(f"📡 Response: {response.text}")
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            hotmart_access_token = token_data.get('access_token')
+            expires_in = token_data.get('expires_in', 3600)
+            token_expires_at = datetime.now() + timedelta(seconds=expires_in - 300)
+            print(f"✅ Token obtido com método 3!")
+            return hotmart_access_token
+        
+        print(f"❌ Todos os métodos falharam")
+        return None
             
     except Exception as e:
         print(f"❌ Erro na requisição do token: {str(e)}")
@@ -117,7 +195,7 @@ def verify_buyer_in_hotmart(email):
         return False
     
     try:
-        print(f"🔍 Verificando comprador: {email}")
+        print(f"🔍 Verificando comprador na Hotmart: {email}")
         
         headers = {
             'Authorization': f'Bearer {access_token}',
@@ -143,6 +221,7 @@ def verify_buyer_in_hotmart(email):
         )
         
         print(f"📊 Status assinaturas: {subscription_response.status_code}")
+        print(f"📊 Response assinaturas: {subscription_response.text[:200]}...")
         
         if subscription_response.status_code == 200:
             subscription_data = subscription_response.json()
@@ -179,6 +258,7 @@ def verify_buyer_in_hotmart(email):
         )
         
         print(f"📊 Status vendas: {sales_response.status_code}")
+        print(f"📊 Response vendas: {sales_response.text[:200]}...")
         
         if sales_response.status_code == 200:
             sales_data = sales_response.json()
@@ -196,37 +276,35 @@ def verify_buyer_in_hotmart(email):
                 cache_expires_at = datetime.now() + timedelta(minutes=10)
                 return True
         
-        print(f"❌ Nenhuma compra encontrada para {email}")
+        print(f"❌ Nenhuma compra encontrada na Hotmart para {email}")
         return False
         
     except Exception as e:
-        print(f"❌ Erro ao verificar comprador: {str(e)}")
+        print(f"❌ Erro ao verificar comprador na Hotmart: {str(e)}")
         return False
 
 def is_authorized_buyer(email):
-    """Verifica se o email está autorizado (Hotmart + lista local)"""
+    """Verifica se o email está autorizado (lista local + Hotmart)"""
     email = email.lower().strip()
-    
-    # Lista local para testes e admins
-    local_authorized = {
-        'admin@moedor.com',
-        'teste@moedor.com'
-    }
     
     print(f"\n🔍 === VERIFICAÇÃO DE COMPRADOR ===")
     print(f"📧 Email: '{email}'")
     
-    # Verificar lista local primeiro
-    if email in local_authorized:
+    # Verificar lista local primeiro (para garantir que funciona)
+    if email in local_authorized_buyers:
         print(f"✅ Autorizado pela lista local")
         print(f"================================\n")
         return True
     
-    # Verificar na Hotmart
-    if verify_buyer_in_hotmart(email):
-        print(f"✅ Autorizado pela Hotmart")
-        print(f"================================\n")
-        return True
+    # Verificar na Hotmart (se configurado)
+    if HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET:
+        print(f"🔍 Verificando na Hotmart...")
+        if verify_buyer_in_hotmart(email):
+            print(f"✅ Autorizado pela Hotmart")
+            print(f"================================\n")
+            return True
+    else:
+        print(f"⚠️ Hotmart não configurado, usando apenas lista local")
     
     print(f"❌ Não autorizado")
     print(f"================================\n")
@@ -253,6 +331,7 @@ def debug():
     return render_template_string(debug_template, 
                                 hotmart_configured=bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET),
                                 verified_buyers=len(verified_buyers),
+                                local_buyers=len(local_authorized_buyers),
                                 cache_expires=cache_expires_at.isoformat() if cache_expires_at else None,
                                 token_expires=token_expires_at.isoformat() if token_expires_at else None)
 
@@ -265,7 +344,10 @@ def test_hotmart():
         return jsonify({
             'status': 'error',
             'message': 'Não foi possível obter token da Hotmart',
-            'configured': bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET)
+            'configured': bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET),
+            'client_id_present': bool(HOTMART_CLIENT_ID),
+            'client_secret_present': bool(HOTMART_CLIENT_SECRET),
+            'basic_token_present': bool(HOTMART_BASIC_TOKEN)
         })
     
     return jsonify({
@@ -281,6 +363,7 @@ def api_status():
     return jsonify({
         'hotmart_configured': bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET),
         'verified_buyers': len(verified_buyers),
+        'local_buyers': len(local_authorized_buyers),
         'users_online': len(authenticated_users),
         'cache_expires': cache_expires_at.isoformat() if cache_expires_at else None,
         'token_expires': token_expires_at.isoformat() if token_expires_at else None
@@ -350,11 +433,12 @@ def logout():
 def admin():
     return render_template_string(admin_template, 
                                 verified_buyers=len(verified_buyers),
+                                local_buyers=len(local_authorized_buyers),
                                 authenticated_users=authenticated_users,
                                 messages=messages,
                                 hotmart_configured=bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET))
 
-# Templates
+# Templates (mantendo os mesmos do arquivo anterior)
 login_template = '''
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -627,16 +711,17 @@ debug_template = '''
             <a href="/" class="back-btn">← Voltar ao Sistema</a>
         </div>
         
-        <div class="status-box {% if not hotmart_configured %}error-box{% endif %}">
+        <div class="status-box {% if not hotmart_configured %}warning-box{% endif %}">
             <h3>🔑 Configuração Hotmart</h3>
-            <p><strong>Status:</strong> {% if hotmart_configured %}✅ Configurado{% else %}❌ Não configurado{% endif %}</p>
+            <p><strong>Status:</strong> {% if hotmart_configured %}✅ Configurado{% else %}⚠️ Não configurado{% endif %}</p>
             <p><strong>Client ID:</strong> {% if hotmart_configured %}✅ Presente{% else %}❌ Ausente{% endif %}</p>
             <p><strong>Client Secret:</strong> {% if hotmart_configured %}✅ Presente{% else %}❌ Ausente{% endif %}</p>
         </div>
         
         <div class="status-box">
-            <h3>👥 Compradores Verificados</h3>
-            <p><strong>Total:</strong> {{ verified_buyers }}</p>
+            <h3>👥 Compradores Autorizados</h3>
+            <p><strong>Lista Local:</strong> {{ local_buyers }}</p>
+            <p><strong>Verificados Hotmart:</strong> {{ verified_buyers }}</p>
             <p><strong>Cache expira:</strong> {{ cache_expires or 'Não definido' }}</p>
         </div>
         
@@ -661,6 +746,13 @@ HOTMART_BASIC_TOKEN=seu_basic_token_aqui
 HOTMART_PRODUCT_ID=seu_product_id_aqui (opcional)
             </pre>
         </div>
+        
+        <div class="status-box">
+            <h3>ℹ️ Informações Importantes</h3>
+            <p>• O sistema usa uma lista local para garantir acesso mesmo se a API da Hotmart falhar</p>
+            <p>• Email <strong>leo-brde@hotmail.com</strong> foi adicionado à lista local para teste</p>
+            <p>• Verifique os logs do servidor para detalhes sobre tentativas de autenticação</p>
+        </div>
     </div>
     
     <script>
@@ -671,14 +763,17 @@ HOTMART_PRODUCT_ID=seu_product_id_aqui (opcional)
                 document.getElementById('test-results').innerHTML = `
                     <div style="background: ${data.status === 'success' ? '#004400' : '#440000'}; padding: 10px; margin: 10px 0; border-radius: 4px;">
                         <strong>Teste Hotmart:</strong> ${data.message}<br>
-                        <strong>Status:</strong> ${data.status}
+                        <strong>Status:</strong> ${data.status}<br>
+                        ${data.client_id_present !== undefined ? '<strong>Client ID:</strong> ' + (data.client_id_present ? 'Presente' : 'Ausente') + '<br>' : ''}
+                        ${data.client_secret_present !== undefined ? '<strong>Client Secret:</strong> ' + (data.client_secret_present ? 'Presente' : 'Ausente') + '<br>' : ''}
+                        ${data.basic_token_present !== undefined ? '<strong>Basic Token:</strong> ' + (data.basic_token_present ? 'Presente' : 'Ausente') + '<br>' : ''}
                     </div>
                 `;
             });
         }
         
         function testBuyer() {
-            const email = prompt('Digite um email para testar:');
+            const email = prompt('Digite um email para testar:', 'leo-brde@hotmail.com');
             if (email) {
                 fetch('/login', {
                     method: 'POST',
@@ -1148,18 +1243,18 @@ admin_template = '''
         
         <div class="stats-grid">
             <div class="stat-box">
+                <div class="stat-number">{{ local_buyers }}</div>
+                <div class="stat-label">Compradores Lista Local</div>
+            </div>
+            
+            <div class="stat-box">
                 <div class="stat-number">{{ verified_buyers }}</div>
-                <div class="stat-label">Compradores Verificados</div>
+                <div class="stat-label">Verificados Hotmart</div>
             </div>
             
             <div class="stat-box">
                 <div class="stat-number">{{ authenticated_users|length }}</div>
                 <div class="stat-label">Usuários Online</div>
-            </div>
-            
-            <div class="stat-box">
-                <div class="stat-number">{{ messages|length }}</div>
-                <div class="stat-label">Mensagens Enviadas</div>
             </div>
             
             <div class="stat-box">
@@ -1189,10 +1284,11 @@ def handle_message(data):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
-    print(f"\n🚀 MOEDOR AO VIVO - Sistema com OAuth Hotmart")
+    print(f"\n🚀 MOEDOR AO VIVO - Sistema com OAuth Hotmart (Debug)")
     print(f"======================================")
     print(f"🔒 CONFIGURAÇÃO:")
     print(f"   📡 Hotmart: {'✅ Configurado' if HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET else '❌ Não configurado'}")
+    print(f"   👥 Lista Local: {len(local_authorized_buyers)} emails")
     print(f"   🌐 Porta: {port}")
     print(f"   🔗 URL: http://0.0.0.0:{port}")
     print(f"======================================\n")
