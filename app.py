@@ -674,5 +674,5 @@ if __name__ == '__main__':
     print("⚡ Performance: Máxima (Local)")
     print(f"🔗 Auth Server: {AUTH_SERVER_URL}")
     
-    socketio.run(app, host='0.0.0.0', port=5001, debug=True)
+    socketio.run(app, host='192.168.86.28', port=5001, debug=True)
 
