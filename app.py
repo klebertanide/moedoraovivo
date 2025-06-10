@@ -41,10 +41,7 @@ cache_expires_at = None
 # Lista local para testes (enquanto API não funciona)
 local_authorized_buyers = {
     'admin@moedor.com',
-    'teste@moedor.com',
-    'leo-brde@hotmail.com',  # Adicionado para teste
-    'kaa.naomi25@gmail.com',
-    'dudu.s.poton@gmail.com'
+    'teste@moedor.com'
 }
 
 # Dados em memória
