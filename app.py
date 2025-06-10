@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MOEDOR AO VIVO - Versão para Deploy no Render.com
-Sistema com webhook Hotmart e URL permanente
+MOEDOR AO VIVO - Sistema com OAuth Hotmart
+Autenticação automática de compradores via API da Hotmart
 """
 
 from flask import Flask, render_template_string, send_from_directory, request, session, redirect, url_for, jsonify
@@ -10,23 +10,33 @@ import os
 import json
 import hashlib
 import hmac
+import requests
+import base64
 from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'moedor-ao-vivo-2024-secure')
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# Lista inicial de compradores (será atualizada pelo webhook)
-authorized_buyers = {
-    'admin@moedor.com',
-    'teste@moedor.com',
-}
+# Configurações da Hotmart (via variáveis de ambiente)
+HOTMART_CLIENT_ID = os.environ.get('HOTMART_CLIENT_ID', '')
+HOTMART_CLIENT_SECRET = os.environ.get('HOTMART_CLIENT_SECRET', '')
+HOTMART_BASIC_TOKEN = os.environ.get('HOTMART_BASIC_TOKEN', '')
+HOTMART_PRODUCT_ID = os.environ.get('HOTMART_PRODUCT_ID', '')
 
-# Log de webhooks recebidos
-webhook_logs = []
-hotmart_buyers = set()  # Compradores vindos da Hotmart
+# URLs da API Hotmart
+HOTMART_AUTH_URL = "https://api-sec-vlc.hotmart.com/security/oauth/token"
+HOTMART_SUBSCRIPTIONS_URL = "https://developers.hotmart.com/payments/api/v1/subscriptions"
+HOTMART_SALES_URL = "https://developers.hotmart.com/payments/api/v1/sales"
+
+# Cache de tokens e compradores
+hotmart_access_token = None
+token_expires_at = None
+verified_buyers = set()
+cache_expires_at = None
 
 # Dados em memória
 users_online = 0
@@ -42,35 +52,185 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def get_hotmart_access_token():
+    """Obtém access token da Hotmart"""
+    global hotmart_access_token, token_expires_at
+    
+    # Verificar se token ainda é válido
+    if hotmart_access_token and token_expires_at and datetime.now() < token_expires_at:
+        return hotmart_access_token
+    
+    if not HOTMART_CLIENT_ID or not HOTMART_CLIENT_SECRET or not HOTMART_BASIC_TOKEN:
+        print("❌ Credenciais da Hotmart não configuradas")
+        return None
+    
+    try:
+        print("🔑 Obtendo access token da Hotmart...")
+        
+        # Preparar dados da requisição
+        data = {
+            'grant_type': 'client_credentials',
+            'client_id': HOTMART_CLIENT_ID,
+            'client_secret': HOTMART_CLIENT_SECRET
+        }
+        
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': f'Basic {HOTMART_BASIC_TOKEN}'
+        }
+        
+        # Fazer requisição
+        response = requests.post(HOTMART_AUTH_URL, data=data, headers=headers, timeout=30)
+        
+        print(f"📡 Status da requisição: {response.status_code}")
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            hotmart_access_token = token_data.get('access_token')
+            expires_in = token_data.get('expires_in', 3600)
+            
+            # Calcular quando o token expira (com margem de segurança)
+            token_expires_at = datetime.now() + timedelta(seconds=expires_in - 300)
+            
+            print(f"✅ Token obtido com sucesso! Expira em: {token_expires_at}")
+            return hotmart_access_token
+        else:
+            print(f"❌ Erro ao obter token: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Erro na requisição do token: {str(e)}")
+        return None
+
+def verify_buyer_in_hotmart(email):
+    """Verifica se o email é um comprador válido na Hotmart"""
+    global verified_buyers, cache_expires_at
+    
+    # Verificar cache (válido por 10 minutos)
+    if cache_expires_at and datetime.now() < cache_expires_at:
+        return email.lower() in verified_buyers
+    
+    # Obter token de acesso
+    access_token = get_hotmart_access_token()
+    if not access_token:
+        print("❌ Não foi possível obter token da Hotmart")
+        return False
+    
+    try:
+        print(f"🔍 Verificando comprador: {email}")
+        
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Buscar nas assinaturas ativas
+        subscription_params = {
+            'subscriber_email': email,
+            'status': 'ACTIVE',
+            'max_results': 50
+        }
+        
+        if HOTMART_PRODUCT_ID:
+            subscription_params['product_id'] = HOTMART_PRODUCT_ID
+        
+        print(f"📡 Buscando assinaturas para: {email}")
+        subscription_response = requests.get(
+            HOTMART_SUBSCRIPTIONS_URL, 
+            headers=headers, 
+            params=subscription_params,
+            timeout=30
+        )
+        
+        print(f"📊 Status assinaturas: {subscription_response.status_code}")
+        
+        if subscription_response.status_code == 200:
+            subscription_data = subscription_response.json()
+            items = subscription_data.get('items', [])
+            
+            if items:
+                print(f"✅ Encontradas {len(items)} assinaturas ativas para {email}")
+                verified_buyers.add(email.lower())
+                cache_expires_at = datetime.now() + timedelta(minutes=10)
+                return True
+        
+        # Se não encontrou assinaturas, buscar nas vendas
+        print(f"📡 Buscando vendas para: {email}")
+        
+        # Buscar vendas dos últimos 365 dias
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365)
+        
+        sales_params = {
+            'buyer_email': email,
+            'start_date': int(start_date.timestamp() * 1000),
+            'end_date': int(end_date.timestamp() * 1000),
+            'max_results': 50
+        }
+        
+        if HOTMART_PRODUCT_ID:
+            sales_params['product_id'] = HOTMART_PRODUCT_ID
+        
+        sales_response = requests.get(
+            HOTMART_SALES_URL,
+            headers=headers,
+            params=sales_params,
+            timeout=30
+        )
+        
+        print(f"📊 Status vendas: {sales_response.status_code}")
+        
+        if sales_response.status_code == 200:
+            sales_data = sales_response.json()
+            items = sales_data.get('items', [])
+            
+            # Verificar se há vendas aprovadas
+            approved_sales = [
+                item for item in items 
+                if item.get('purchase', {}).get('status') in ['APPROVED', 'COMPLETE']
+            ]
+            
+            if approved_sales:
+                print(f"✅ Encontradas {len(approved_sales)} vendas aprovadas para {email}")
+                verified_buyers.add(email.lower())
+                cache_expires_at = datetime.now() + timedelta(minutes=10)
+                return True
+        
+        print(f"❌ Nenhuma compra encontrada para {email}")
+        return False
+        
+    except Exception as e:
+        print(f"❌ Erro ao verificar comprador: {str(e)}")
+        return False
+
 def is_authorized_buyer(email):
-    """Verifica se o email está autorizado (lista inicial + Hotmart)"""
+    """Verifica se o email está autorizado (Hotmart + lista local)"""
     email = email.lower().strip()
     
-    # Combinar lista inicial + compradores da Hotmart
-    all_buyers = authorized_buyers.union(hotmart_buyers)
+    # Lista local para testes e admins
+    local_authorized = {
+        'admin@moedor.com',
+        'teste@moedor.com'
+    }
     
     print(f"\n🔍 === VERIFICAÇÃO DE COMPRADOR ===")
     print(f"📧 Email: '{email}'")
-    print(f"📋 Compradores iniciais: {len(authorized_buyers)}")
-    print(f"🛒 Compradores Hotmart: {len(hotmart_buyers)}")
-    print(f"📊 Total autorizado: {len(all_buyers)}")
-    print(f"✅ Autorizado: {email in all_buyers}")
+    
+    # Verificar lista local primeiro
+    if email in local_authorized:
+        print(f"✅ Autorizado pela lista local")
+        print(f"================================\n")
+        return True
+    
+    # Verificar na Hotmart
+    if verify_buyer_in_hotmart(email):
+        print(f"✅ Autorizado pela Hotmart")
+        print(f"================================\n")
+        return True
+    
+    print(f"❌ Não autorizado")
     print(f"================================\n")
-    
-    return email in all_buyers
-
-def log_webhook(data, source="unknown"):
-    """Registra webhook recebido"""
-    webhook_logs.append({
-        'timestamp': datetime.now().isoformat(),
-        'source': source,
-        'data': data,
-        'headers': dict(request.headers) if request else {}
-    })
-    
-    # Manter apenas os últimos 50 logs
-    if len(webhook_logs) > 50:
-        webhook_logs.pop(0)
+    return False
 
 # Servir arquivos estáticos
 @app.route('/<path:filename>')
@@ -87,267 +247,44 @@ def index():
     return redirect(url_for('login'))
 
 # ENDPOINTS DE TESTE E DEBUG
-@app.route('/test-webhook')
-def test_webhook_page():
-    """Página para testar webhook manualmente"""
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Teste de Webhook - MOEDOR AO VIVO</title>
-        <style>
-            body { font-family: Arial; background: #000; color: #fff; padding: 20px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            .form-group { margin: 15px 0; }
-            label { display: block; margin-bottom: 5px; color: #00aa00; }
-            input, textarea, select { width: 100%; padding: 10px; background: #111; border: 1px solid #333; color: #fff; }
-            button { background: #00aa00; color: white; padding: 10px 20px; border: none; cursor: pointer; margin: 5px; }
-            .log { background: #111; padding: 10px; margin: 10px 0; border-left: 3px solid #00aa00; }
-            .error { border-left-color: #ff4444; }
-            .success { border-left-color: #00aa00; }
-            .header { text-align: center; margin-bottom: 30px; }
-            .back-btn { background: #666; color: white; padding: 8px 15px; text-decoration: none; border-radius: 4px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🧪 Teste de Webhook Hotmart</h1>
-                <a href="/" class="back-btn">← Voltar ao Sistema</a>
-            </div>
-            
-            <form onsubmit="testWebhook(event)">
-                <div class="form-group">
-                    <label>Email do Comprador:</label>
-                    <input type="email" id="buyerEmail" value="teste.comprador@email.com" required>
-                </div>
-                
-                <div class="form-group">
-                    <label>Evento:</label>
-                    <select id="eventType">
-                        <option value="PURCHASE_APPROVED">PURCHASE_APPROVED</option>
-                        <option value="PURCHASE_COMPLETE">PURCHASE_COMPLETE</option>
-                        <option value="PURCHASE_BILLET_PRINTED">PURCHASE_BILLET_PRINTED</option>
-                    </select>
-                </div>
-                
-                <button type="submit">🚀 Simular Webhook</button>
-                <button type="button" onclick="loadStatus()">🔄 Atualizar Status</button>
-                <button type="button" onclick="loadLogs()">📝 Carregar Logs</button>
-            </form>
-            
-            <h2>📊 Status do Sistema</h2>
-            <div id="status"></div>
-            
-            <h2>📝 Logs de Webhook (Últimos 10)</h2>
-            <div id="logs"></div>
-            
-            <h2>👥 Compradores Autorizados</h2>
-            <div id="buyers"></div>
-        </div>
-        
-        <script>
-            function testWebhook(event) {
-                event.preventDefault();
-                
-                const email = document.getElementById('buyerEmail').value;
-                const eventType = document.getElementById('eventType').value;
-                
-                const webhookData = {
-                    event: eventType,
-                    data: {
-                        buyer: {
-                            email: email,
-                            name: "Comprador Teste"
-                        },
-                        product: {
-                            id: "123456",
-                            name: "MOEDOR"
-                        }
-                    }
-                };
-                
-                fetch('/webhook/hotmart', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(webhookData)
-                })
-                .then(response => response.json())
-                .then(data => {
-                    alert('✅ Webhook enviado com sucesso!');
-                    loadStatus();
-                    loadLogs();
-                })
-                .catch(error => {
-                    alert('❌ Erro: ' + error);
-                });
-            }
-            
-            function loadStatus() {
-                fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('status').innerHTML = `
-                        <div class="log success">
-                            <strong>📊 Compradores Autorizados:</strong> ${data.total_buyers}<br>
-                            <strong>📋 Iniciais:</strong> ${data.initial_buyers}<br>
-                            <strong>🛒 Da Hotmart:</strong> ${data.hotmart_buyers}<br>
-                            <strong>📝 Webhooks Recebidos:</strong> ${data.webhook_count}<br>
-                            <strong>👥 Usuários Online:</strong> ${data.users_online}
-                        </div>
-                    `;
-                    
-                    const buyersHtml = data.buyers_list.map(email => `
-                        <div class="log">📧 ${email}</div>
-                    `).join('');
-                    document.getElementById('buyers').innerHTML = buyersHtml;
-                });
-            }
-            
-            function loadLogs() {
-                fetch('/api/webhook-logs')
-                .then(response => response.json())
-                .then(data => {
-                    const logsHtml = data.logs.map(log => `
-                        <div class="log ${log.source === 'error' ? 'error' : 'success'}">
-                            <strong>⏰ ${log.timestamp}</strong> - 📡 ${log.source}<br>
-                            <pre>${JSON.stringify(log.data, null, 2)}</pre>
-                        </div>
-                    `).join('');
-                    document.getElementById('logs').innerHTML = logsHtml || '<div class="log">Nenhum log ainda</div>';
-                });
-            }
-            
-            // Carregar dados iniciais
-            loadStatus();
-            loadLogs();
-            
-            // Atualizar a cada 5 segundos
-            setInterval(() => {
-                loadStatus();
-                loadLogs();
-            }, 5000);
-        </script>
-    </body>
-    </html>
-    '''
+@app.route('/debug')
+def debug():
+    """Página de debug com informações do sistema"""
+    return render_template_string(debug_template, 
+                                hotmart_configured=bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET),
+                                verified_buyers=len(verified_buyers),
+                                cache_expires=cache_expires_at.isoformat() if cache_expires_at else None,
+                                token_expires=token_expires_at.isoformat() if token_expires_at else None)
+
+@app.route('/test-hotmart')
+def test_hotmart():
+    """Testa conexão com a API da Hotmart"""
+    token = get_hotmart_access_token()
+    
+    if not token:
+        return jsonify({
+            'status': 'error',
+            'message': 'Não foi possível obter token da Hotmart',
+            'configured': bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET)
+        })
+    
+    return jsonify({
+        'status': 'success',
+        'message': 'Conexão com Hotmart funcionando',
+        'token_expires': token_expires_at.isoformat() if token_expires_at else None,
+        'verified_buyers': len(verified_buyers)
+    })
 
 @app.route('/api/status')
 def api_status():
     """Status do sistema em JSON"""
-    all_buyers = authorized_buyers.union(hotmart_buyers)
     return jsonify({
-        'total_buyers': len(all_buyers),
-        'initial_buyers': len(authorized_buyers),
-        'hotmart_buyers': len(hotmart_buyers),
-        'webhook_count': len(webhook_logs),
+        'hotmart_configured': bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET),
+        'verified_buyers': len(verified_buyers),
         'users_online': len(authenticated_users),
-        'buyers_list': sorted(list(all_buyers))
+        'cache_expires': cache_expires_at.isoformat() if cache_expires_at else None,
+        'token_expires': token_expires_at.isoformat() if token_expires_at else None
     })
-
-@app.route('/api/webhook-logs')
-def api_webhook_logs():
-    """Logs de webhook em JSON"""
-    return jsonify({
-        'logs': webhook_logs[-10:],  # Últimos 10 logs
-        'total': len(webhook_logs)
-    })
-
-# WEBHOOK DA HOTMART - VERSÃO COM DEBUG COMPLETO
-@app.route('/webhook/hotmart', methods=['POST', 'GET'])
-def hotmart_webhook():
-    """Webhook para receber notificações da Hotmart"""
-    
-    if request.method == 'GET':
-        return jsonify({
-            'status': 'Webhook ativo',
-            'method': 'POST esperado',
-            'url': request.url,
-            'timestamp': datetime.now().isoformat()
-        })
-    
-    try:
-        # Log da requisição completa
-        print(f"\n🔔 === WEBHOOK RECEBIDO ===")
-        print(f"⏰ Timestamp: {datetime.now()}")
-        print(f"🌐 URL: {request.url}")
-        print(f"📋 Headers: {dict(request.headers)}")
-        print(f"📦 Content-Type: {request.content_type}")
-        
-        # Tentar diferentes formatos de dados
-        webhook_data = None
-        
-        if request.content_type == 'application/json':
-            webhook_data = request.get_json()
-            print(f"📄 JSON Data: {webhook_data}")
-        elif request.content_type == 'application/x-www-form-urlencoded':
-            webhook_data = dict(request.form)
-            print(f"📄 Form Data: {webhook_data}")
-        else:
-            # Tentar como texto
-            raw_data = request.get_data(as_text=True)
-            print(f"📄 Raw Data: {raw_data}")
-            try:
-                webhook_data = json.loads(raw_data)
-            except:
-                webhook_data = {'raw': raw_data}
-        
-        # Registrar no log
-        log_webhook(webhook_data, 'hotmart')
-        
-        # Processar dados se for evento de compra
-        if webhook_data and isinstance(webhook_data, dict):
-            event = webhook_data.get('event', '').upper()
-            print(f"🎯 Evento: {event}")
-            
-            if event in ['PURCHASE_APPROVED', 'PURCHASE_COMPLETE', 'PURCHASE_BILLET_PRINTED']:
-                # Tentar extrair email do comprador
-                buyer_email = None
-                
-                # Formato padrão da Hotmart
-                if 'data' in webhook_data and 'buyer' in webhook_data['data']:
-                    buyer_email = webhook_data['data']['buyer'].get('email')
-                
-                # Formato alternativo
-                elif 'buyer' in webhook_data:
-                    buyer_email = webhook_data['buyer'].get('email')
-                
-                # Formato direto
-                elif 'email' in webhook_data:
-                    buyer_email = webhook_data['email']
-                
-                if buyer_email:
-                    buyer_email = buyer_email.lower().strip()
-                    hotmart_buyers.add(buyer_email)
-                    
-                    print(f"✅ NOVO COMPRADOR ADICIONADO: {buyer_email}")
-                    print(f"📊 Total de compradores Hotmart: {len(hotmart_buyers)}")
-                    
-                    # Notificar via WebSocket
-                    socketio.emit('new_buyer', {
-                        'email': buyer_email,
-                        'timestamp': datetime.now().isoformat(),
-                        'event': event,
-                        'source': 'hotmart'
-                    })
-                else:
-                    print(f"❌ Email do comprador não encontrado nos dados")
-            else:
-                print(f"ℹ️ Evento ignorado: {event}")
-        
-        print(f"========================\n")
-        
-        return jsonify({'status': 'success', 'timestamp': datetime.now().isoformat()}), 200
-    
-    except Exception as e:
-        error_msg = str(e)
-        print(f"❌ ERRO NO WEBHOOK: {error_msg}")
-        
-        log_webhook({'error': error_msg}, 'error')
-        
-        return jsonify({'status': 'error', 'message': error_msg}), 400
 
 # TESTE DE CONECTIVIDADE
 @app.route('/ping')
@@ -356,9 +293,8 @@ def ping():
     return jsonify({
         'status': 'ok',
         'timestamp': datetime.now().isoformat(),
-        'message': 'MOEDOR AO VIVO está funcionando!',
-        'url': request.url,
-        'ip': request.remote_addr,
+        'message': 'MOEDOR AO VIVO com OAuth Hotmart está funcionando!',
+        'hotmart_configured': bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET),
         'environment': 'render' if os.environ.get('RENDER') else 'local'
     })
 
@@ -396,7 +332,7 @@ def login():
             print(f"❌ LOGIN NEGADO: {email}")
             print(f"==============================\n")
             return render_template_string(login_template, 
-                error="Email não encontrado na lista de compradores. Aguarde alguns minutos se você acabou de comprar, ou entre em contato com o suporte.")
+                error="Email não encontrado na lista de compradores. Verifique se você possui uma assinatura ativa do MOEDOR ou entre em contato com o suporte.")
     
     return render_template_string(login_template)
 
@@ -412,13 +348,11 @@ def logout():
 @app.route('/admin')
 @login_required
 def admin():
-    all_buyers = authorized_buyers.union(hotmart_buyers)
     return render_template_string(admin_template, 
-                                authorized_count=len(all_buyers),
+                                verified_buyers=len(verified_buyers),
                                 authenticated_users=authenticated_users,
                                 messages=messages,
-                                webhook_count=len(webhook_logs),
-                                hotmart_buyers=len(hotmart_buyers))
+                                hotmart_configured=bool(HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET))
 
 # Templates
 login_template = '''
@@ -545,44 +479,18 @@ login_template = '''
             color: white;
             padding: 15px 30px;
             border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
             cursor: pointer;
-            font-family: 'ZURITA', 'Impact', monospace;
-            font-size: 1.1rem;
+            transition: all 0.3s ease;
             text-transform: uppercase;
             letter-spacing: 1px;
-            transition: all 0.3s ease;
-            margin-top: 10px;
         }
         
         .login-btn:hover {
+            background: linear-gradient(135deg, #cc0000, #990000);
             transform: translateY(-2px);
-            box-shadow: 0 8px 25px rgba(255, 68, 68, 0.4);
-            background: linear-gradient(135deg, #ff6666, #ee0000);
-        }
-        
-        .subscribe-btn {
-            background: linear-gradient(135deg, #00aa00, #006600);
-            border: none;
-            color: white;
-            padding: 15px 30px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-family: 'ZURITA', 'Impact', monospace;
-            font-size: 1.1rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            transition: all 0.3s ease;
-            margin-top: 15px;
-            text-decoration: none;
-            display: inline-block;
-            width: 100%;
-            text-align: center;
-        }
-        
-        .subscribe-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 25px rgba(0, 170, 0, 0.4);
-            background: linear-gradient(135deg, #00cc00, #008800);
+            box-shadow: 0 5px 15px rgba(255, 68, 68, 0.4);
         }
         
         .error-message {
@@ -590,307 +498,683 @@ login_template = '''
             border: 1px solid #ff4444;
             color: #ff6666;
             padding: 12px;
-            border-radius: 6px;
+            border-radius: 8px;
             margin-bottom: 20px;
             font-size: 0.9rem;
-            text-align: left;
-            line-height: 1.4;
         }
         
-        .info-box {
-            background: rgba(0, 170, 0, 0.1);
-            border: 1px solid #00aa00;
-            color: #00cc00;
-            padding: 15px;
-            border-radius: 6px;
-            margin-top: 20px;
-            font-size: 0.85rem;
-            line-height: 1.4;
-        }
-        
-        .debug-links {
-            margin-top: 20px;
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-        }
-        
-        .debug-link {
-            background: #666;
+        .subscribe-btn {
+            background: linear-gradient(135deg, #00aa00, #008800);
             border: none;
             color: white;
-            padding: 8px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.8rem;
-            text-decoration: none;
-            transition: all 0.3s ease;
-        }
-        
-        .debug-link:hover {
-            background: #888;
-        }
-        
-        .divider {
-            margin: 25px 0;
-            text-align: center;
-            position: relative;
-        }
-        
-        .divider::before {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 0;
-            right: 0;
-            height: 1px;
-            background: #333;
-        }
-        
-        .divider span {
-            background: rgba(17, 17, 17, 0.95);
-            padding: 0 15px;
-            color: #666;
+            padding: 12px 25px;
+            border-radius: 8px;
             font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 15px;
         }
         
-        @media (max-width: 480px) {
-            .login-container {
-                padding: 30px 20px;
-            }
-            .logo-image {
-                width: 120px;
-                height: 120px;
-            }
-            .debug-links {
-                flex-direction: column;
-            }
+        .subscribe-btn:hover {
+            background: linear-gradient(135deg, #008800, #006600);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 170, 0, 0.4);
+        }
+        
+        .footer-text {
+            color: #666;
+            font-size: 0.8rem;
+            margin-top: 20px;
+        }
+        
+        .debug-btn {
+            background: #333;
+            color: #ccc;
+            border: 1px solid #555;
+            padding: 8px 15px;
+            border-radius: 5px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 10px;
+        }
+        
+        .debug-btn:hover {
+            background: #444;
+            color: #fff;
         }
     </style>
 </head>
 <body>
     <div class="login-container">
         <div class="logo-container">
-            <img src="/logo.png" alt="MOEDOR AO VIVO" class="logo-image" 
-                 onerror="this.style.display='none'; document.querySelector('.logo-text').style.display='block';">
-            <h1 class="logo-text" style="display: none;">MOEDOR AO VIVO</h1>
-            <p class="subtitle">Acesso Exclusivo para Compradores</p>
+            <img src="/logo.png" alt="MOEDOR AO VIVO" class="logo-image" onerror="this.style.display='none'; document.querySelector('.logo-text').style.display='block';">
+            <div class="logo-text" style="display: none;">MOEDOR AO VIVO</div>
         </div>
+        
+        <h2 class="subtitle">Acesso Exclusivo para Assinantes</h2>
         
         {% if error %}
-        <div class="error-message">
-            ❌ {{ error }}
-        </div>
+        <div class="error-message">{{ error }}</div>
         {% endif %}
         
-        <form class="login-form" method="POST">
+        <form method="POST" class="login-form">
             <div class="form-group">
-                <label class="form-label" for="email">📧 Email da Compra</label>
-                <input type="email" 
-                       id="email" 
-                       name="email" 
-                       class="form-input" 
-                       placeholder="Digite o email usado na compra..."
-                       required
-                       autocomplete="email">
+                <label for="email" class="form-label">Email de Compra:</label>
+                <input type="email" id="email" name="email" class="form-input" 
+                       placeholder="Digite o email usado na compra" required>
             </div>
             
-            <button type="submit" class="login-btn">
-                🔓 Acessar MOEDOR AO VIVO
-            </button>
+            <button type="submit" class="login-btn">Entrar no Sistema</button>
         </form>
         
-        <div class="divider">
-            <span>ou</span>
-        </div>
-        
-        <a href="https://moedor.com" class="subscribe-btn" target="_blank">
+        <a href="https://moedor.com" class="subscribe-btn">
             🚀 Assinar o MOEDOR Agora
         </a>
         
-        <div class="debug-links">
-            <a href="/test-webhook" class="debug-link">
-                🧪 Testar Webhook
-            </a>
-            <a href="/api/status" class="debug-link">
-                📊 Status
-            </a>
-            <a href="/ping" class="debug-link">
-                🏓 Ping
-            </a>
+        <div class="footer-text">
+            Sistema com verificação automática via Hotmart<br>
+            Apenas assinantes ativos podem acessar
         </div>
         
-        <div class="info-box">
-            🔒 <strong>Sistema Hospedado no Render.com</strong><br>
-            URL permanente e webhook estável. Compradores são adicionados automaticamente.
-        </div>
+        <a href="/debug" class="debug-btn">Debug do Sistema</a>
     </div>
     
     <script>
-        document.getElementById('email' ).focus();
+        // Verificar se logo carregou
+        document.querySelector('.logo-image').onload = function() {
+            console.log('✅ Logo carregado!');
+            this.style.display = 'block';
+            document.querySelector('.logo-text').style.display = 'none';
+        };
         
-        document.getElementById('email').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                document.querySelector('.login-form').submit();
-            }
-        });
-        
-        document.querySelector('.login-form').addEventListener('submit', function() {
-            const btn = document.querySelector('.login-btn');
-            btn.innerHTML = '🔄 Verificando compra...';
-            btn.disabled = true;
+        // Verificar se fonte carregou
+        document.fonts.ready.then(function() {
+            console.log('✅ Fontes carregadas!');
         });
     </script>
 </body>
 </html>
 '''
 
-# Template principal simplificado
-main_template = '''
+debug_template = '''
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-    <title>MOEDOR AO VIVO</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Debug - MOEDOR AO VIVO</title>
     <style>
-        body { background: #000; color: #fff; font-family: Arial; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
+        body { font-family: Arial; background: #000; color: #fff; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .status-box { background: #111; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #00aa00; }
+        .error-box { border-left-color: #ff4444; }
+        .warning-box { border-left-color: #ffaa00; }
         .header { text-align: center; margin-bottom: 30px; }
-        .cameras { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }
-        .camera { background: #111; border: 2px solid #ff4444; border-radius: 10px; padding: 20px; text-align: center; }
-        .chat { background: #111; border: 2px solid #00aa00; border-radius: 10px; padding: 20px; }
-        .logout-btn { position: absolute; top: 20px; right: 20px; background: #666; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }
+        .back-btn { background: #666; color: white; padding: 8px 15px; text-decoration: none; border-radius: 4px; }
+        pre { background: #222; padding: 10px; border-radius: 4px; overflow-x: auto; }
+        .test-btn { background: #00aa00; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
     </style>
 </head>
 <body>
-    <a href="/logout" class="logout-btn">🚪 Sair</a>
-    
     <div class="container">
         <div class="header">
-            <h1>🎥 MOEDOR AO VIVO</h1>
-            <p>Sistema funcionando no Render.com!</p>
+            <h1>🔍 Debug - MOEDOR AO VIVO com OAuth Hotmart</h1>
+            <a href="/" class="back-btn">← Voltar ao Sistema</a>
         </div>
         
-        <div class="cameras">
-            <div class="camera">
-                <h3>📹 Câmera 1</h3>
-                <p>Stream principal</p>
-                <button style="background: #ff4444; color: white; padding: 10px 20px; border: none; border-radius: 5px; margin: 5px;">
-                    💰 Envergonhar Apresentador (R$ 20)
-                </button>
-            </div>
-            
-            <div class="camera">
-                <h3>📹 Câmera 2</h3>
-                <p>Stream secundário</p>
-                <button style="background: #00aa00; color: white; padding: 10px 20px; border: none; border-radius: 5px; margin: 5px;">
-                    🛒 Enviar uma Grana pra Participar
-                </button>
-            </div>
+        <div class="status-box {% if not hotmart_configured %}error-box{% endif %}">
+            <h3>🔑 Configuração Hotmart</h3>
+            <p><strong>Status:</strong> {% if hotmart_configured %}✅ Configurado{% else %}❌ Não configurado{% endif %}</p>
+            <p><strong>Client ID:</strong> {% if hotmart_configured %}✅ Presente{% else %}❌ Ausente{% endif %}</p>
+            <p><strong>Client Secret:</strong> {% if hotmart_configured %}✅ Presente{% else %}❌ Ausente{% endif %}</p>
         </div>
         
-        <div class="chat">
-            <h3>💬 Chat ao Vivo</h3>
-            <div style="background: #000; padding: 15px; border-radius: 5px; margin: 10px 0; min-height: 200px;">
-                <p>💬 Sistema de chat funcionando!</p>
-                <p>🔗 Webhook integrado com Hotmart</p>
-                <p>✅ Deploy realizado com sucesso no Render.com</p>
-            </div>
-            
-            <div style="display: flex; gap: 10px; margin-top: 15px;">
-                <input type="text" placeholder="Digite sua mensagem..." style="flex: 1; padding: 10px; background: #222; border: 1px solid #444; color: #fff; border-radius: 5px;">
-                <button style="background: #00aa00; color: white; padding: 10px 20px; border: none; border-radius: 5px;">Enviar</button>
-            </div>
+        <div class="status-box">
+            <h3>👥 Compradores Verificados</h3>
+            <p><strong>Total:</strong> {{ verified_buyers }}</p>
+            <p><strong>Cache expira:</strong> {{ cache_expires or 'Não definido' }}</p>
         </div>
         
-        <div style="text-align: center; margin-top: 30px; padding: 20px; background: #111; border-radius: 10px;">
-            <h3>🎯 Sistema Funcionando!</h3>
-            <p>✅ Deploy no Render.com realizado com sucesso</p>
-            <p>✅ Webhook da Hotmart configurado</p>
-            <p>✅ Sistema de login funcionando</p>
-            <p>✅ URL permanente ativa</p>
-            
-            <div style="margin-top: 20px;">
-                <a href="/admin" style="background: #666; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">
-                    🎛️ Painel Admin
-                </a>
-                <a href="/test-webhook" style="background: #666; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">
-                    🧪 Testar Webhook
-                </a>
-                <a href="/api/status" style="background: #666; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">
-                    📊 Status
-                </a>
-            </div>
+        <div class="status-box">
+            <h3>🔐 Token de Acesso</h3>
+            <p><strong>Token expira:</strong> {{ token_expires or 'Não obtido' }}</p>
+        </div>
+        
+        <div class="status-box">
+            <h3>🧪 Testes</h3>
+            <button class="test-btn" onclick="testHotmart()">Testar Conexão Hotmart</button>
+            <button class="test-btn" onclick="testBuyer()">Testar Verificação de Comprador</button>
+            <div id="test-results"></div>
+        </div>
+        
+        <div class="status-box">
+            <h3>📋 Variáveis de Ambiente Necessárias</h3>
+            <pre>
+HOTMART_CLIENT_ID=seu_client_id_aqui
+HOTMART_CLIENT_SECRET=seu_client_secret_aqui  
+HOTMART_BASIC_TOKEN=seu_basic_token_aqui
+HOTMART_PRODUCT_ID=seu_product_id_aqui (opcional)
+            </pre>
         </div>
     </div>
+    
+    <script>
+        function testHotmart() {
+            fetch('/test-hotmart')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('test-results').innerHTML = `
+                    <div style="background: ${data.status === 'success' ? '#004400' : '#440000'}; padding: 10px; margin: 10px 0; border-radius: 4px;">
+                        <strong>Teste Hotmart:</strong> ${data.message}<br>
+                        <strong>Status:</strong> ${data.status}
+                    </div>
+                `;
+            });
+        }
+        
+        function testBuyer() {
+            const email = prompt('Digite um email para testar:');
+            if (email) {
+                fetch('/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: `email=${encodeURIComponent(email)}`
+                })
+                .then(response => {
+                    if (response.redirected) {
+                        document.getElementById('test-results').innerHTML = `
+                            <div style="background: #004400; padding: 10px; margin: 10px 0; border-radius: 4px;">
+                                <strong>Teste Comprador:</strong> ✅ Email ${email} é um comprador válido!
+                            </div>
+                        `;
+                    } else {
+                        document.getElementById('test-results').innerHTML = `
+                            <div style="background: #440000; padding: 10px; margin: 10px 0; border-radius: 4px;">
+                                <strong>Teste Comprador:</strong> ❌ Email ${email} não é um comprador válido
+                            </div>
+                        `;
+                    }
+                });
+            }
+        }
+    </script>
 </body>
 </html>
 '''
 
-# Template admin simplificado
+main_template = '''
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MOEDOR AO VIVO</title>
+    <style>
+        @font-face {
+            font-family: 'ZURITA';
+            src: url('/ZURITA.otf') format('opentype');
+            font-weight: normal;
+            font-style: normal;
+            font-display: swap;
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            background: #000;
+            color: #fff;
+            overflow-x: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #ff4444, #cc0000);
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(255, 68, 68, 0.3);
+        }
+        
+        .logo {
+            font-family: 'ZURITA', 'Impact', monospace;
+            font-size: 3rem;
+            font-weight: 900;
+            color: #fff;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            font-size: 1.2rem;
+            color: #ffcccc;
+            font-weight: 300;
+        }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+            padding: 20px;
+            min-height: calc(100vh - 120px);
+        }
+        
+        .video-section {
+            background: #111;
+            border-radius: 15px;
+            padding: 20px;
+            border: 2px solid #333;
+        }
+        
+        .cameras-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .camera-feed {
+            background: #000;
+            border: 2px solid #ff4444;
+            border-radius: 10px;
+            aspect-ratio: 16/9;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 1.1rem;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .camera-label {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(255, 68, 68, 0.8);
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        
+        .action-buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .action-btn {
+            background: linear-gradient(135deg, #ff4444, #cc0000);
+            border: none;
+            color: white;
+            padding: 15px 20px;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .action-btn:hover {
+            background: linear-gradient(135deg, #cc0000, #990000);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(255, 68, 68, 0.4);
+        }
+        
+        .action-btn.expensive {
+            background: linear-gradient(135deg, #ffaa00, #ff8800);
+        }
+        
+        .action-btn.expensive:hover {
+            background: linear-gradient(135deg, #ff8800, #ff6600);
+            box-shadow: 0 5px 15px rgba(255, 170, 0, 0.4);
+        }
+        
+        .tooltip {
+            position: absolute;
+            bottom: 120%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.9);
+            color: #fff;
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            white-space: nowrap;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s ease;
+            z-index: 1000;
+            max-width: 300px;
+            white-space: normal;
+            text-align: center;
+        }
+        
+        .action-btn:hover .tooltip {
+            opacity: 1;
+            visibility: visible;
+        }
+        
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .chat-section, .mural-section {
+            background: #111;
+            border-radius: 15px;
+            padding: 20px;
+            border: 2px solid #333;
+            flex: 1;
+        }
+        
+        .section-title {
+            font-family: 'ZURITA', 'Impact', monospace;
+            font-size: 1.5rem;
+            color: #ff4444;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+        
+        .chat-description {
+            background: rgba(0, 170, 0, 0.1);
+            border: 1px solid #00aa00;
+            color: #00ff00;
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+        
+        .mural-description {
+            background: rgba(255, 170, 0, 0.1);
+            border: 1px solid #ffaa00;
+            color: #ffaa00;
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+        
+        .chat-input {
+            width: 100%;
+            padding: 12px;
+            background: #222;
+            border: 2px solid #444;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 1rem;
+            margin-bottom: 10px;
+        }
+        
+        .chat-input:focus {
+            outline: none;
+            border-color: #00aa00;
+        }
+        
+        .send-btn {
+            width: 100%;
+            background: linear-gradient(135deg, #00aa00, #008800);
+            border: none;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .send-btn:hover {
+            background: linear-gradient(135deg, #008800, #006600);
+            transform: translateY(-1px);
+        }
+        
+        .messages {
+            max-height: 200px;
+            overflow-y: auto;
+            margin-bottom: 15px;
+            padding: 10px;
+            background: #0a0a0a;
+            border-radius: 8px;
+        }
+        
+        .message {
+            margin-bottom: 10px;
+            padding: 8px;
+            background: #1a1a1a;
+            border-radius: 5px;
+            border-left: 3px solid #00aa00;
+        }
+        
+        .mural-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .mural-item {
+            background: #222;
+            border: 2px solid #ffaa00;
+            border-radius: 8px;
+            aspect-ratio: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 0.8rem;
+            text-align: center;
+        }
+        
+        .logout-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #666;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+        
+        .logout-btn:hover {
+            background: #888;
+        }
+        
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .cameras-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .action-buttons {
+                grid-template-columns: 1fr;
+            }
+            
+            .logo {
+                font-size: 2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <a href="/logout" class="logout-btn">Sair</a>
+    
+    <div class="header">
+        <div class="logo">MOEDOR AO VIVO</div>
+        <div class="subtitle">Sistema Exclusivo para Assinantes</div>
+    </div>
+    
+    <div class="main-content">
+        <div class="video-section">
+            <div class="cameras-grid">
+                <div class="camera-feed">
+                    <div class="camera-label">CÂMERA 1</div>
+                    <div>Feed da Câmera Principal</div>
+                </div>
+                <div class="camera-feed">
+                    <div class="camera-label">CÂMERA 2</div>
+                    <div>Feed da Câmera Secundária</div>
+                </div>
+            </div>
+            
+            <div class="action-buttons">
+                <button class="action-btn expensive">
+                    🎭 Envergonhar Apresentador
+                    <div class="tooltip">O programa será interrompido por uma verdade extremamente constrangedora sobre um dos apresentadores. Alguém ficará cinza de vergonha.</div>
+                </button>
+                <button class="action-btn">
+                    💰 Enviar uma Grana pra Participar
+                    <div class="tooltip">A qualquer momento podemos vender algo. Caneca exclusiva, pack do pé, camiseta ou algo que surgir durante a conversa.</div>
+                </button>
+            </div>
+        </div>
+        
+        <div class="sidebar">
+            <div class="chat-section">
+                <div class="section-title">💬 Interaja com Nois!</div>
+                <div class="chat-description">
+                    Suas mensagens aparecerão na tela e serão pauta do nosso papo!
+                </div>
+                <div class="messages" id="messages">
+                    <div class="message">Sistema iniciado! Envie sua mensagem.</div>
+                </div>
+                <input type="text" class="chat-input" id="messageInput" placeholder="Digite sua mensagem...">
+                <button class="send-btn" onclick="sendMessage()">Enviar Mensagem</button>
+            </div>
+            
+            <div class="mural-section">
+                <div class="section-title">🫠 Mural do Derretimento</div>
+                <div class="mural-description">
+                    Prints capturados aleatoriamente quando um dos integrantes faz uma cara bizarra, leva um susto, grita, chora ou chupa um pênis.
+                </div>
+                <div class="mural-grid" id="muralGrid">
+                    <div class="mural-item">Print 1</div>
+                    <div class="mural-item">Print 2</div>
+                    <div class="mural-item">Print 3</div>
+                    <div class="mural-item">Print 4</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script>
+        const socket = io();
+        
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            
+            if (message) {
+                socket.emit('new_message', {
+                    message: message,
+                    timestamp: new Date().toISOString()
+                });
+                input.value = '';
+            }
+        }
+        
+        document.getElementById('messageInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        socket.on('message_received', function(data) {
+            const messagesDiv = document.getElementById('messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message';
+            messageDiv.innerHTML = `<strong>Usuário:</strong> ${data.message}`;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        });
+        
+        // Verificar se logo carregou
+        console.log('✅ Sistema MOEDOR AO VIVO carregado!');
+        
+        // Verificar se fonte carregou
+        document.fonts.ready.then(function() {
+            console.log('✅ Fontes carregadas!');
+        });
+    </script>
+</body>
+</html>
+'''
+
 admin_template = '''
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin - MOEDOR AO VIVO</title>
     <style>
-        body { background: #000; color: #fff; font-family: Arial; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: #111; border: 2px solid #00aa00; border-radius: 10px; padding: 20px; text-align: center; }
+        body { font-family: Arial; background: #000; color: #fff; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stat-box { background: #111; padding: 20px; border-radius: 10px; border-left: 4px solid #00aa00; }
+        .stat-number { font-size: 2rem; font-weight: bold; color: #00aa00; }
+        .stat-label { color: #ccc; margin-top: 5px; }
         .back-btn { background: #666; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px;">
-            <h1>🎛️ Painel Administrativo</h1>
-            <a href="/" class="back-btn">← Voltar</a>
+        <div class="header">
+            <h1>🎛️ Painel Administrativo - MOEDOR AO VIVO</h1>
+            <a href="/" class="back-btn">← Voltar ao Sistema</a>
         </div>
         
-        <div class="stats">
-            <div class="stat-card">
-                <h3>👥 Compradores</h3>
-                <p style="font-size: 2rem; margin: 10px 0;">{{ authorized_count }}</p>
-                <p>Total autorizados</p>
+        <div class="stats-grid">
+            <div class="stat-box">
+                <div class="stat-number">{{ verified_buyers }}</div>
+                <div class="stat-label">Compradores Verificados</div>
             </div>
             
-            <div class="stat-card">
-                <h3>🔗 Webhooks</h3>
-                <p style="font-size: 2rem; margin: 10px 0;">{{ webhook_count }}</p>
-                <p>Recebidos da Hotmart</p>
+            <div class="stat-box">
+                <div class="stat-number">{{ authenticated_users|length }}</div>
+                <div class="stat-label">Usuários Online</div>
             </div>
             
-            <div class="stat-card">
-                <h3>🛒 Hotmart</h3>
-                <p style="font-size: 2rem; margin: 10px 0;">{{ hotmart_buyers }}</p>
-                <p>Compradores via webhook</p>
+            <div class="stat-box">
+                <div class="stat-number">{{ messages|length }}</div>
+                <div class="stat-label">Mensagens Enviadas</div>
             </div>
             
-            <div class="stat-card">
-                <h3>💬 Mensagens</h3>
-                <p style="font-size: 2rem; margin: 10px 0;">{{ messages|length }}</p>
-                <p>Total no chat</p>
+            <div class="stat-box">
+                <div class="stat-number">{% if hotmart_configured %}✅{% else %}❌{% endif %}</div>
+                <div class="stat-label">Hotmart Configurado</div>
             </div>
         </div>
         
-        <div style="background: #111; border: 2px solid #ff4444; border-radius: 10px; padding: 20px;">
-            <h3>📊 Status do Sistema</h3>
-            <p>✅ Sistema rodando no Render.com</p>
-            <p>✅ Webhook da Hotmart ativo</p>
-            <p>✅ Sistema de login funcionando</p>
-            <p>✅ URL permanente configurada</p>
-            
-            <div style="margin-top: 20px;">
-                <a href="/test-webhook" style="background: #00aa00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">
-                    🧪 Testar Webhook
-                </a>
-                <a href="/api/status" style="background: #00aa00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">
-                    📊 Ver Status JSON
-                </a>
-                <a href="/api/webhook-logs" style="background: #00aa00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px;">
-                    📝 Ver Logs
-                </a>
+        <div style="background: #111; padding: 20px; border-radius: 10px;">
+            <h3>👥 Usuários Autenticados</h3>
+            {% for email, user in authenticated_users.items() %}
+            <div style="background: #222; padding: 10px; margin: 5px 0; border-radius: 5px;">
+                <strong>{{ email }}</strong> - Login: {{ user.login_time.strftime('%H:%M:%S') }}
             </div>
+            {% endfor %}
         </div>
     </div>
 </body>
@@ -898,38 +1182,20 @@ admin_template = '''
 '''
 
 # WebSocket events
-@socketio.on('send_message')
+@socketio.on('new_message')
 def handle_message(data):
-    global messages
-    if 'user_email' not in session or not session.get('authenticated'):
-        return
-    
-    data['user_email'] = session['user_email']
     messages.append(data)
-    emit('new_message', data, broadcast=True)
+    emit('message_received', data, broadcast=True)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
-    
-    print("🚀 MOEDOR AO VIVO - Versão Render.com")
-    print("=" * 60)
-    print("🌐 DEPLOY PERMANENTE:")
-    print("   - URL fixa que nunca muda")
-    print("   - Webhook estável")
-    print("   - Sem necessidade de ngrok")
-    print()
-    print("🔧 FUNCIONALIDADES:")
-    print("   - Logs detalhados de webhook")
-    print("   - Página de teste: /test-webhook")
-    print("   - Status da API: /api/status")
-    print("   - Teste de conectividade: /ping")
-    print()
-    print("✅ COMPRADORES INICIAIS:")
-    for email in sorted(authorized_buyers):
-        print(f"   📧 {email}")
-    print()
-    print(f"🌐 Porta: {port}")
-    print("⏹️ Pressione Ctrl+C para parar")
-    print("=" * 60)
+    print(f"\n🚀 MOEDOR AO VIVO - Sistema com OAuth Hotmart")
+    print(f"======================================")
+    print(f"🔒 CONFIGURAÇÃO:")
+    print(f"   📡 Hotmart: {'✅ Configurado' if HOTMART_CLIENT_ID and HOTMART_CLIENT_SECRET else '❌ Não configurado'}")
+    print(f"   🌐 Porta: {port}")
+    print(f"   🔗 URL: http://0.0.0.0:{port}")
+    print(f"======================================\n")
     
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
+
